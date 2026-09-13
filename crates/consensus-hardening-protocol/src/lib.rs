@@ -17,6 +17,7 @@ pub mod devil;
 pub mod validators;
 pub mod dossier;
 pub mod registry;
+pub(crate) mod safe_path;
 pub mod contracts;
 pub mod orchestrator;
 pub mod context;

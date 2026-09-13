@@ -13,6 +13,7 @@
 pub mod session;
 pub mod bridge;
 pub mod models;
+pub(crate) mod safe_path;
 
 pub use session::{TfSession, SessionConfig, SessionPool};
 pub use bridge::{PyTfBridge, OnnxImporter};

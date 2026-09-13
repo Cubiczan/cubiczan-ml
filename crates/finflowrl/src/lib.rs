@@ -1,4 +1,5 @@
 pub mod config;
+pub(crate) mod safe_path;
 pub mod experts;
 pub mod models;
 pub mod envs;
