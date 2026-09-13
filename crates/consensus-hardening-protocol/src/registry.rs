@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use crate::models::*;
+use crate::safe_path::resolve_under_allowed_bases;
 
 fn meaningful_tokens(text: &str) -> HashSet<String> {
     let stop: HashSet<&str> = [
@@ -93,21 +94,23 @@ impl DecisionRegistry {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let path = resolve_under_allowed_bases(path)?;
         let mut data = HashMap::new();
         for (id, case) in &self.cases {
             let val = serde_json::to_value(case)?;
             data.insert(id.clone(), val);
         }
         let json = serde_json::to_string_pretty(&data)?;
-        std::fs::write(path, json)?;
+        std::fs::write(&path, json)?;
         Ok(())
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let path = resolve_under_allowed_bases(path)?;
         if !path.exists() {
             return Ok(Self::new());
         }
-        let raw = std::fs::read_to_string(path)?;
+        let raw = std::fs::read_to_string(&path)?;
         let map: HashMap<String, serde_json::Value> = serde_json::from_str(&raw)?;
         let mut registry = Self::new();
         for (id, case_data) in map {
@@ -177,6 +180,37 @@ mod tests {
         assert_eq!(loaded.get("dc-1").unwrap().title, "Test");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_save_rejects_traversal() {
+        let mut reg = DecisionRegistry::new();
+        reg.add(DecisionCase::new("dc-1", "Test", "finance", "alice"));
+        let err = reg.save(Path::new("../escaped_registry.json")).unwrap_err();
+        assert!(err.to_string().contains("traversal") || err.to_string().contains("escapes") || err.to_string().contains("outside"));
+        assert!(!Path::new("../escaped_registry.json").exists());
+    }
+
+    #[test]
+    fn test_load_rejects_traversal() {
+        match DecisionRegistry::load(Path::new("../../etc/passwd")) {
+            Ok(_) => panic!("expected path traversal to be rejected"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("traversal") || msg.contains("escapes") || msg.contains("outside"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_load_rejects_etc_passwd() {
+        match DecisionRegistry::load(Path::new("/etc/passwd")) {
+            Ok(_) => panic!("expected /etc/passwd to be rejected"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("outside") || msg.contains("escapes") || msg.contains("traversal"));
+            }
+        }
     }
 
     #[test]

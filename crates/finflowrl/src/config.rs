@@ -6,7 +6,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use thiserror::Error;
+
+use crate::safe_path::{resolve_under_allowed_bases, PathError};
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -16,6 +19,14 @@ pub enum ConfigError {
     Json(#[from] serde_json::Error),
     #[error("Key not found: {0}")]
     KeyNotFound(String),
+    #[error("path is not allowed: {0}")]
+    PathNotAllowed(String),
+}
+
+impl From<PathError> for ConfigError {
+    fn from(e: PathError) -> Self {
+        ConfigError::PathNotAllowed(e.0)
+    }
 }
 
 /// A nested configuration value that can be a leaf (f64, string, etc.) or a sub-tree.
@@ -230,15 +241,17 @@ impl Config {
 
     /// Load configuration from a JSON file.
     pub fn load(path: &str) -> Result<Self, ConfigError> {
-        let content = fs::read_to_string(path)?;
+        let path = resolve_under_allowed_bases(Path::new(path))?;
+        let content = fs::read_to_string(&path)?;
         let root: ConfigValue = serde_json::from_str(&content)?;
         Ok(Self { root })
     }
 
     /// Save configuration to a JSON file.
     pub fn save(&self, path: &str) -> Result<(), ConfigError> {
+        let path = resolve_under_allowed_bases(Path::new(path))?;
         let content = serde_json::to_string_pretty(&self.root)?;
-        fs::write(path, content)?;
+        fs::write(&path, content)?;
         Ok(())
     }
 
@@ -323,6 +336,39 @@ mod tests {
         );
 
         let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_config_save_rejects_traversal() {
+        let config = Config::new();
+        let err = config.save("../escaped_finflowrl.json").unwrap_err();
+        match err {
+            ConfigError::PathNotAllowed(msg) => {
+                assert!(msg.contains("traversal") || msg.contains("escapes") || msg.contains("outside"));
+            }
+            other => panic!("expected PathNotAllowed, got {other:?}"),
+        }
+        assert!(!Path::new("../escaped_finflowrl.json").exists());
+    }
+
+    #[test]
+    fn test_config_load_rejects_traversal() {
+        let err = Config::load("../../etc/passwd").unwrap_err();
+        match err {
+            ConfigError::PathNotAllowed(msg) => {
+                assert!(msg.contains("traversal") || msg.contains("escapes") || msg.contains("outside"));
+            }
+            other => panic!("expected PathNotAllowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_config_load_rejects_etc_passwd() {
+        let err = Config::load("/etc/passwd").unwrap_err();
+        match err {
+            ConfigError::PathNotAllowed(_) => {}
+            other => panic!("expected PathNotAllowed, got {other:?}"),
+        }
     }
 
     #[test]

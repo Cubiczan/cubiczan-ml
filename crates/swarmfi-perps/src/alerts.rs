@@ -29,9 +29,10 @@
 
 use crate::types::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 /// Platform to send alerts to.
@@ -271,6 +272,178 @@ impl Default for DiscordConfig {
 pub struct WebhookConfig {
     pub url: String,
     pub headers: HashMap<String, String>,
+    /// Additional hostname allowlist entries for this webhook (exact match, lowercase).
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+/// Hosts that outbound alert HTTP may target by default.
+const DEFAULT_ALLOWED_ALERT_HOSTS: &[&str] = &[
+    "api.telegram.org",
+    "discord.com",
+    "discordapp.com",
+    "canary.discord.com",
+];
+
+const BLOCKED_ALERT_HOSTS: &[&str] = &[
+    "localhost",
+    "localhost.localdomain",
+    "metadata",
+    "metadata.google.internal",
+    "metadata.google.com",
+    "metadata.goog",
+    "kubernetes.default",
+    "kubernetes.default.svc",
+    "kubernetes.default.svc.cluster.local",
+];
+
+/// Whether `ip` is loopback, link-local, private, metadata, or otherwise unroutable.
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+    }
+}
+
+fn is_blocked_ipv4(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_unspecified()
+        || v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || (o[0] == 0)
+        // CGNAT 100.64.0.0/10
+        || (o[0] == 100 && o[1] >= 64 && o[1] <= 127)
+        // Benchmarking 198.18.0.0/15
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+        // IETF protocol assignments / reserved
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        // Alibaba / some cloud metadata
+        || (o == [100, 100, 100, 200])
+        || (o == [169, 254, 169, 254])
+}
+
+fn is_blocked_ipv6(v6: Ipv6Addr) -> bool {
+    if v6.is_unspecified() || v6.is_loopback() {
+        return true;
+    }
+    let s = v6.segments();
+    // Unique local fc00::/7
+    if s[0] & 0xfe00 == 0xfc00 {
+        return true;
+    }
+    // Link-local fe80::/10
+    if s[0] & 0xffc0 == 0xfe80 {
+        return true;
+    }
+    // IPv4-mapped
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return is_blocked_ipv4(v4);
+    }
+    // Deprecated IPv4-compatible
+    if let Some(v4) = v6.to_ipv4() {
+        if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+            return is_blocked_ipv4(v4);
+        }
+    }
+    false
+}
+
+fn host_matches_allowlist(host: &str, extra: &[String]) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    DEFAULT_ALLOWED_ALERT_HOSTS
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
+        || extra
+            .iter()
+            .any(|allowed| {
+                let allowed = allowed.trim_end_matches('.').to_ascii_lowercase();
+                !allowed.is_empty() && (host == allowed || host.ends_with(&format!(".{allowed}")))
+            })
+}
+
+fn is_blocked_hostname(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    BLOCKED_ALERT_HOSTS.contains(&host.as_str())
+        || host.ends_with(".localhost")
+        || host.ends_with(".internal")
+        || host.ends_with(".local")
+}
+
+/// Validate an outbound alert URL: https only, host allowlist, no credentials,
+/// and no link-local / metadata / private destination (including DNS results).
+pub fn validate_alert_url(raw: &str, extra_hosts: &[String]) -> anyhow::Result<reqwest::Url> {
+    validate_alert_url_with_resolve(raw, extra_hosts, true)
+}
+
+fn validate_alert_url_with_resolve(
+    raw: &str,
+    extra_hosts: &[String],
+    resolve_dns: bool,
+) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).map_err(|e| anyhow::anyhow!("invalid alert URL: {e}"))?;
+    if url.scheme() != "https" {
+        anyhow::bail!("alert URL scheme must be https");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("alert URLs with credentials are not allowed");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("alert URL is missing a host"))?;
+
+    if is_blocked_hostname(host) {
+        anyhow::bail!("alert URL host is blocked: {host}");
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip(ip) {
+            anyhow::bail!("alert URL target IP is blocked: {ip}");
+        }
+        if !host_matches_allowlist(host, extra_hosts) {
+            anyhow::bail!("alert URL host is not in the allowlist: {host}");
+        }
+    } else if !host_matches_allowlist(host, extra_hosts) {
+        anyhow::bail!("alert URL host is not in the allowlist: {host}");
+    }
+
+    if resolve_dns {
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addrs = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| anyhow::anyhow!("failed to resolve alert URL host {host}: {e}"))?;
+        let mut saw_any = false;
+        for addr in addrs {
+            saw_any = true;
+            if is_blocked_ip(addr.ip()) {
+                anyhow::bail!(
+                    "alert URL host {host} resolved to blocked address {}",
+                    addr.ip()
+                );
+            }
+        }
+        if !saw_any {
+            anyhow::bail!("alert URL host {host} resolved to no addresses");
+        }
+    }
+
+    Ok(url)
+}
+
+fn telegram_token_is_safe(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-')
+}
+
+fn alert_http_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build alert HTTP client: {e}"))
 }
 
 /// Stateful alert manager with rate limiting and deduplication.
@@ -425,19 +598,23 @@ pub async fn send_telegram_alert(config: &TelegramConfig, alert: &Alert) -> anyh
     if config.bot_token.is_empty() || config.chat_id.is_empty() {
         anyhow::bail!("Telegram config incomplete: bot_token or chat_id is empty");
     }
+    if !telegram_token_is_safe(&config.bot_token) {
+        anyhow::bail!("Telegram bot token contains invalid characters");
+    }
 
     let url = format!(
         "https://api.telegram.org/bot{}/sendMessage",
         config.bot_token
     );
+    let url = validate_alert_url(&url, &[])?;
     let payload = serde_json::json!({
         "chat_id": config.chat_id,
         "text": alert.to_text(),
         "parse_mode": config.parse_mode,
     });
 
-    let client = reqwest::Client::new();
-    let resp = client.post(&url).json(&payload).send().await?;
+    let client = alert_http_client()?;
+    let resp = client.post(url).json(&payload).send().await?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await?;
@@ -452,12 +629,13 @@ pub async fn send_discord_alert(config: &DiscordConfig, alert: &Alert) -> anyhow
     if config.webhook_url.is_empty() {
         anyhow::bail!("Discord webhook URL is empty");
     }
+    let url = validate_alert_url(&config.webhook_url, &[])?;
 
     let mut payload = alert.to_discord_embed();
     payload["username"] = serde_json::json!(config.username);
 
-    let client = reqwest::Client::new();
-    let resp = client.post(&config.webhook_url).json(&payload).send().await?;
+    let client = alert_http_client()?;
+    let resp = client.post(url).json(&payload).send().await?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await?;
@@ -472,9 +650,10 @@ pub async fn send_webhook_alert(config: &WebhookConfig, alert: &Alert) -> anyhow
     if config.url.is_empty() {
         anyhow::bail!("Webhook URL is empty");
     }
+    let url = validate_alert_url(&config.url, &config.allowed_hosts)?;
 
     let body = serde_json::to_string(alert)?;
-    let mut builder = reqwest::Client::new().post(&config.url);
+    let mut builder = alert_http_client()?.post(url);
     builder = builder.header("Content-Type", "application/json");
     for (key, value) in &config.headers {
         builder = builder.header(key.as_str(), value.as_str());
@@ -767,6 +946,141 @@ mod tests {
     fn test_alert_platform_as_str() {
         assert_eq!(AlertPlatform::Telegram.as_str(), "TELEGRAM");
         assert_eq!(AlertPlatform::Discord.as_str(), "DISCORD");
+    }
+
+    #[test]
+    fn test_ssrf_rejects_non_https() {
+        for raw in [
+            "http://discord.com/api/webhooks/1/abc",
+            "file:///etc/passwd",
+            "ftp://discord.com/x",
+        ] {
+            let err = validate_alert_url_with_resolve(raw, &[], false).unwrap_err();
+            assert!(
+                err.to_string().contains("https") || err.to_string().contains("invalid"),
+                "{raw}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssrf_rejects_metadata_and_link_local() {
+        for raw in [
+            "https://169.254.169.254/latest/meta-data",
+            "https://metadata.google.internal/",
+            "https://localhost/hook",
+            "https://127.0.0.1/hook",
+            "https://[::1]/hook",
+            "https://10.0.0.5/hook",
+            "https://192.168.1.10/hook",
+            "https://172.16.0.2/hook",
+            "https://[fe80::1]/hook",
+            "https://100.100.100.200/latest/meta-data",
+        ] {
+            let err = validate_alert_url_with_resolve(raw, &[], false).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("blocked") || msg.contains("allowlist"),
+                "{raw}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssrf_rejects_unknown_host() {
+        let err = validate_alert_url_with_resolve(
+            "https://evil.example/steal",
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("allowlist"));
+    }
+
+    #[test]
+    fn test_ssrf_allows_discord_and_telegram_hosts() {
+        for raw in [
+            "https://discord.com/api/webhooks/1/abc",
+            "https://discordapp.com/api/webhooks/1/abc",
+            "https://api.telegram.org/bot123:ABC/sendMessage",
+        ] {
+            let url = validate_alert_url_with_resolve(raw, &[], false).unwrap();
+            assert_eq!(url.scheme(), "https");
+        }
+    }
+
+    #[test]
+    fn test_ssrf_extra_allowlist() {
+        let extra = vec!["hooks.example.com".into()];
+        let url = validate_alert_url_with_resolve(
+            "https://hooks.example.com/alert",
+            &extra,
+            false,
+        )
+        .unwrap();
+        assert_eq!(url.host_str(), Some("hooks.example.com"));
+        let err = validate_alert_url_with_resolve(
+            "https://hooks.example.com/alert",
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("allowlist"));
+    }
+
+    #[test]
+    fn test_ssrf_rejects_credentials() {
+        let err = validate_alert_url_with_resolve(
+            "https://user:pass@discord.com/api/webhooks/1/abc",
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("credentials"));
+    }
+
+    #[test]
+    fn test_blocked_ip_helpers() {
+        assert!(is_blocked_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("169.254.169.254".parse().unwrap()));
+        assert!(is_blocked_ip("10.1.2.3".parse().unwrap()));
+        assert!(is_blocked_ip("192.168.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("::1".parse().unwrap()));
+        assert!(is_blocked_ip("fe80::1".parse().unwrap()));
+        assert!(!is_blocked_ip("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_discord_rejects_ssrf_url() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let config = DiscordConfig {
+            webhook_url: "https://169.254.169.254/latest/meta-data".into(),
+            username: "test".into(),
+        };
+        let alert = Alert::new(
+            AlertSeverity::Info,
+            AlertReason::Custom { message: "test".into() },
+            "BTC", Signal::Long, 50.0,
+        );
+        let result = rt.block_on(send_discord_alert(&config, &alert));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_webhook_rejects_ssrf_url() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let config = WebhookConfig {
+            url: "http://127.0.0.1/hook".into(),
+            headers: HashMap::new(),
+            allowed_hosts: vec![],
+        };
+        let alert = Alert::new(
+            AlertSeverity::Info,
+            AlertReason::Custom { message: "test".into() },
+            "BTC", Signal::Long, 50.0,
+        );
+        let result = rt.block_on(send_webhook_alert(&config, &alert));
+        assert!(result.is_err());
     }
 
     #[tokio::test]

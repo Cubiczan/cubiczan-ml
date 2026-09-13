@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use crate::safe_path::resolve_under_allowed_bases;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -48,6 +49,8 @@ impl PyTfBridge {
     /// The directory should contain a `model_metadata.json` file and the
     /// SavedModel or frozen graph files.
     pub fn new(model_path: &Path) -> Result<Self> {
+        let model_path = resolve_under_allowed_bases(model_path)
+            .with_context(|| format!("Sanitizing model path {}", model_path.display()))?;
         let meta_path = model_path.join("model_metadata.json");
         if !meta_path.exists() {
             // Generate default metadata
@@ -70,7 +73,7 @@ impl PyTfBridge {
             );
             return Ok(Self {
                 metadata,
-                model_path: model_path.to_path_buf(),
+                model_path,
             });
         }
 
@@ -85,7 +88,7 @@ impl PyTfBridge {
         );
         Ok(Self {
             metadata,
-            model_path: model_path.to_path_buf(),
+            model_path,
         })
     }
 
@@ -211,8 +214,10 @@ impl OnnxImporter {
     ///
     /// ONNX files start with an 8-byte magic number followed by protobuf.
     pub fn validate_onnx_file(path: &Path) -> Result<bool> {
+        let path = resolve_under_allowed_bases(path)
+            .with_context(|| format!("Sanitizing ONNX path {}", path.display()))?;
         let mut buf = [0u8; 8];
-        let mut file = std::fs::File::open(path)
+        let mut file = std::fs::File::open(&path)
             .with_context(|| format!("Opening {}", path.display()))?;
         std::io::Read::read_exact(&mut file, &mut buf)
             .with_context(|| format!("Reading header of {}", path.display()))?;
@@ -228,7 +233,9 @@ impl OnnxImporter {
 
     /// Get the file size of an ONNX model.
     pub fn model_size(path: &Path) -> Result<u64> {
-        let metadata = std::fs::metadata(path)
+        let path = resolve_under_allowed_bases(path)
+            .with_context(|| format!("Sanitizing ONNX path {}", path.display()))?;
+        let metadata = std::fs::metadata(&path)
             .with_context(|| format!("Getting metadata for {}", path.display()))?;
         Ok(metadata.len())
     }
@@ -257,7 +264,9 @@ impl WeightMigrator {
     ///
     /// Supports .npy format (version 1.0, 2.0, 3.0).
     pub fn load_npy(path: &Path) -> Result<ndarray::ArrayD<f32>> {
-        let content = std::fs::read(path)
+        let path = resolve_under_allowed_bases(path)
+            .with_context(|| format!("Sanitizing npy path {}", path.display()))?;
+        let content = std::fs::read(&path)
             .with_context(|| format!("Reading npy file {}", path.display()))?;
 
         // Check magic: \x93NUMPY
@@ -307,7 +316,9 @@ impl WeightMigrator {
             .iter()
             .flat_map(|f| f.to_le_bytes())
             .collect();
-        std::fs::write(path, &bytes)
+        let path = resolve_under_allowed_bases(path)
+            .with_context(|| format!("Sanitizing weights path {}", path.display()))?;
+        std::fs::write(&path, &bytes)
             .with_context(|| format!("Writing weights to {}", path.display()))?;
         Ok(())
     }
@@ -319,7 +330,9 @@ mod tests {
 
     #[test]
     fn test_bridge_with_nonexistent_path() {
-        let bridge = PyTfBridge::new(Path::new("/nonexistent")).unwrap();
+        let dir = std::env::temp_dir().join("cz_tf_missing_model");
+        let _ = std::fs::remove_dir_all(&dir);
+        let bridge = PyTfBridge::new(&dir).unwrap();
         assert_eq!(bridge.metadata().framework, "tensorflow");
         // A nonexistent path should fail validation (no saved_model.pb)
         assert!(!bridge.validate().unwrap().is_valid());
@@ -327,9 +340,37 @@ mod tests {
 
     #[test]
     fn test_wrapper_generation() {
-        let bridge = PyTfBridge::new(Path::new("/tmp/test_model")).unwrap();
+        let dir = std::env::temp_dir().join("cz_tf_test_model");
+        let bridge = PyTfBridge::new(&dir).unwrap();
         let code = bridge.generate_wrapper().unwrap();
         assert!(code.contains("fn predict"));
+    }
+
+    #[test]
+    fn test_bridge_rejects_traversal() {
+        match PyTfBridge::new(Path::new("../etc/passwd")) {
+            Ok(_) => panic!("expected path traversal to be rejected"),
+            Err(err) => {
+                let msg = format!("{err:#}");
+                assert!(msg.contains("traversal") || msg.contains("escapes") || msg.contains("outside"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_onnx_rejects_traversal() {
+        let err = OnnxImporter::validate_onnx_file(Path::new("../../etc/passwd")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("traversal") || msg.contains("escapes") || msg.contains("outside"));
+    }
+
+    #[test]
+    fn test_weights_reject_traversal() {
+        let dummy = ndarray::ArrayD::<f32>::zeros(ndarray::IxDyn(&[1]));
+        let err = WeightMigrator::save_weights(Path::new("../stolen.bin"), &dummy).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("traversal") || msg.contains("escapes") || msg.contains("outside"));
+        assert!(!Path::new("../stolen.bin").exists());
     }
 
     #[test]
